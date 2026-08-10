@@ -1,0 +1,10 @@
+[project]
+name = "ndbc_buoy_scraper"
+version = "0.1.0"
+description = "A web scraper for NDBC buoy data using Scrapy."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pandas>=3.0.2",
+    "scrapy>=2.15.1",
+]
