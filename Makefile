@@ -1,5 +1,14 @@
 .PHONY: scrape up silver health pipeline test down db-config
 
+# Absolute path to uv, resolved from the invoking shell's PATH.
+#
+# Every uv target below goes through $(UV) instead of a bare `uv` because
+# `run-bg` re-enters this Makefile under systemd, which supplies only its own
+# minimal PATH -- no login shell, so the ~/.local/bin entry that the uv
+# installer relies on is gone and a bare `uv` fails with 127. Resolving here
+# and passing UV= down to the detached make keeps both paths working.
+UV ?= $(shell command -v uv 2>/dev/null || printf '%s/.local/bin/uv' "$$HOME")
+
 # Pipeline order: scrape (host, Scrapy) -> silver (host, DuckDB). Each stage
 # reads the previous stage's output off the shared ./data bind mount; none
 # of them re-does a prior stage's work.
@@ -10,7 +19,7 @@
 # form (`python -m scrapy`) is the verified-working invocation.
 scrape:
 	@echo "Running Scrapy spider on host -> writing bronze parquet to data/bronze/"
-	uv run python -m scrapy crawl ndbc_standard_meterological
+	$(UV) run python -m scrapy crawl ndbc_standard_meterological
 
 # Start Postgres only, waiting for its healthcheck (db/init.sql runs
 # automatically on first init against a fresh pgdata volume).
@@ -24,12 +33,12 @@ up:
 # Set SILVER_FORCE=1 to rebuild every year regardless.
 silver:
 	@echo "Running DuckDB silver job -> rebuilding changed year partitions"
-	uv run python -m ndbc_buoy_scraper.silver
+	$(UV) run python -m ndbc_buoy_scraper.silver
 
 # Freshness + last-run probe. Exits non-zero when unhealthy, so it works as a
 # monitoring check as-is -- run it after a run, or from an external probe.
 health:
-	uv run python -m ndbc_buoy_scraper.healthcheck
+	$(UV) run python -m ndbc_buoy_scraper.healthcheck
 
 # Full pipeline, in order. This is what `run-bg` executes detached.
 pipeline: scrape silver
@@ -38,7 +47,7 @@ pipeline: scrape silver
 # containerized runtime split).
 test:
 	@echo "Running pytest suite on the host"
-	uv run pytest tests/
+	$(UV) run pytest tests/
 
 # Stop the stack. Note: this does NOT wipe the pgdata named volume; use
 # `docker compose down -v` manually to also drop Postgres data.
@@ -80,10 +89,14 @@ RUN_UNIT ?= ndbc-run
 # passing the same file through systemd as well would be two mechanisms feeding
 # one set of variables -- and the next person to debug a wrong value would have
 # to know about both.
+#
+# UV= is passed explicitly because the unit gets systemd's minimal PATH, where
+# uv is not resolvable; the value is expanded here, in the login shell that
+# still has it.
 run-bg:
 	sudo systemd-run --collect --unit=$(RUN_UNIT) \
 		--working-directory=$(CURDIR) \
-		/usr/bin/make -C $(CURDIR) pipeline
+		/usr/bin/make -C $(CURDIR) UV=$(UV) pipeline
 	@echo "Started as $(RUN_UNIT). Follow with: make logs"
 
 # Follow the run. Ctrl-C or a dropped connection stops the tail, never the run.
