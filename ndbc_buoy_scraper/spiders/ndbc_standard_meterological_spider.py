@@ -1,5 +1,10 @@
+import datetime as dt
+import hashlib
 import io
+import os
+import re
 from collections.abc import Generator
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import scrapy
@@ -10,59 +15,97 @@ from ndbc_buoy_scraper.coordinates_converter import (
     is_valid_coordinates,
 )
 
+# NDBC stdmet historical filenames follow "<buoy_id>h<YYYY>.txt.gz", e.g.
+# "41001h2020.txt.gz", verified against a live view_text_file.php response.
+FILENAME_YEAR_PATTERN = re.compile(r'h(\d{4})\.txt')
+
+
+def source_identity(url: str) -> tuple[str, str]:
+    """Derive (bronze source stem, four-digit year) from an NDBC data URL.
+
+    Shared by `parse` -- which needs it BEFORE issuing a request, to decide
+    whether that request can be skipped -- and by the download callback, which
+    needs it to name the bronze partition. Both must agree exactly: a mismatch
+    would make the skip check consult a path the writer never uses, silently
+    disabling incremental crawling.
+    """
+    filename = parse_qs(urlparse(url).query).get('filename', [''])[0]
+    if filename:
+        source_stem = re.sub(r'\.txt\.gz$', '', filename)
+    else:
+        # No filename param: fall back to a stable per-URL hash so distinct
+        # malformed responses land in distinct files instead of silently
+        # overwriting the same bronze partition.
+        source_stem = f'unknown-{hashlib.sha1(url.encode()).hexdigest()[:12]}'
+
+    year_match = FILENAME_YEAR_PATTERN.search(filename)
+    year = year_match.group(1) if year_match else 'unknown'
+    return source_stem, year
+
 
 class NDBCStandardMeterologicalSpider(scrapy.Spider):
     name = 'ndbc_standard_meterological'
     start_urls = ['https://www.ndbc.noaa.gov/historical_data.shtml']
     allowed_domains = ['www.ndbc.noaa.gov']
-    _urls_seen = [] # List of urls already seen to avoid going to the same page again
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Instance-level, and a set. As a mutable CLASS attribute this leaked
+        # across every spider instance in a process (so the second crawl in a
+        # CrawlerProcess would skip everything the first one fetched), and as a
+        # list its membership test was O(n) -- quadratic over the 17,050 URLs a
+        # full NDBC crawl visits.
+        self._urls_seen: set[str] = set()
+        self._skipped_cached = 0
+
+    def _bronze_path(self, buoy_id: str, year: str, source_stem: str) -> str:
+        return os.path.join(
+            self.settings.get('BRONZE_ROOT', 'data/bronze'),
+            'observations',
+            f'buoy_id={buoy_id}',
+            f'year={year}',
+            f'{source_stem}.parquet',
+        )
+
+    def _already_have(self, buoy_id: str, year: str, source_stem: str) -> bool:
+        """True when this buoy-year is in bronze AND can never change again.
+
+        NDBC rewrites only the in-progress year's file; once a year closes its
+        historical file is immutable. Re-fetching those is the difference
+        between ~17,000 requests per run and ~1,350.
+        """
+        if self.settings.getbool('NDBC_FULL_REFRESH', False):
+            return False
+        # UTC, not local time. NDBC timestamps are UTC and its year files roll
+        # over on the UTC boundary; a host west of Greenwich would otherwise
+        # spend the last hours of December 31st treating the incoming year as
+        # already closed and skipping its file.
+        current_year = dt.datetime.now(dt.UTC).year
+        if not year.isdigit() or int(year) >= current_year:
+            return False
+        return os.path.exists(self._bronze_path(buoy_id, year, source_stem))
 
     def _get_data_from_url(self, response: Response, buoy_id: str) -> Generator[dict]:
         if response.url in self._urls_seen:
-            print(f"URL {response.url} already seen, skipping.")
-            yield {}
+            self.logger.debug(f"URL {response.url} already seen, skipping.")
+            return
 
+        # Mechanical decode only: no unit-row drop, no renames, no datetime
+        # construction. All semantic transforms live in
+        # ndbc_buoy_scraper/silver.py (DuckDB).
         df = pd.read_csv(io.StringIO(response.text), sep=r'\s+', low_memory=False) # type: ignore
 
-        # Drop the first row which contains the units of the columns
-        df.drop(index=0, inplace=True)
+        source_stem, year = source_identity(response.url)
 
-        year_columnm_name = '#YY' if '#YY' in df.columns else 'YYYY' if 'YYYY' in df.columns else 'YY'
+        self._urls_seen.add(response.url)
 
-        if year_columnm_name == 'YY':  # Avoid ambiguity if both 'YY' and 'YYYY' are present, prioritize 'YYYY'
-            df[year_columnm_name] = df[year_columnm_name].apply(lambda x: f"20{x}" if int(x) < 50 else f"19{x}")
-
-        df.rename(columns={
-            year_columnm_name: 'year',
-            'MM': 'month',
-            'DD': 'day',
-            'hh': 'hour',
-            'mm': 'minute',
-            'WDIR': 'wind_direction',
-            'WSPD': 'wind_speed',
-            'GST': 'gust',
-            'WVHT': 'significant_wave_height',
-            'DPD': 'dominant_wave_period',
-            'APD': 'average_wave_period',
-            'MWD': 'mean_wave_direction',
-            'PRES': 'pressure',
-            'ATMP': 'air_temperature',
-            'WTMP': 'sea_surface_temperature',
-            'DEWP': 'dew_point_temperature',
-            'VIS': 'visibility',
-            'PTDY': 'pressure_tendency',
-            'TIDE': 'tide',
-        }, inplace=True)
-        df['buoy_id'] = buoy_id
-
-        df['datetime'] = pd.to_datetime(df[['year', 'month', 'day', 'hour']])
-        df.drop(columns=['year', 'month', 'day', 'hour'], inplace=True)
-        if 'minute' in df.columns:
-            df.drop(columns=['minute'], inplace=True)
-
-        self._urls_seen.append(response.url) # Add the URL to the list of seen URLs
-
-        yield from df.to_dict(orient='records')
+        yield {
+            'kind': 'observations',
+            'buoy_id': buoy_id,
+            'year': year,
+            'source_stem': source_stem,
+            'records': df.to_dict(orient='records'),
+        }
 
     def _get_station_summary(self, response: Response, buoy_id: str) -> Generator[dict]:
         # This function is a placeholder for future implementation to extract station summary data
@@ -82,20 +125,27 @@ class NDBCStandardMeterologicalSpider(scrapy.Spider):
             if coordinates_text:
                 latitude, longitude = convert_coordinates(coordinates_text)
                 yield {
+                    'kind': 'coordinates',
                     'buoy_id': buoy_id,
                     'latitude': latitude,
                     'longitude': longitude
                 }
             else:
-                print(f"Coordinates not found for buoy {buoy_id} in the station summary page.")
+                self.logger.warning(
+                    f"Coordinates not found for buoy {buoy_id} in the station summary page."
+                )
+                self.crawler.stats.inc_value('ndbc/coordinates_missing')
                 yield {
+                    'kind': 'coordinates',
                     'buoy_id': buoy_id,
                     'latitude': None,
                     'longitude': None
                 }
         except ValueError as e:
-            print(f"Error converting coordinates for buoy {buoy_id}: {e}")
+            self.logger.warning(f"Error converting coordinates for buoy {buoy_id}: {e}")
+            self.crawler.stats.inc_value('ndbc/coordinates_unparseable')
             yield {
+                'kind': 'coordinates',
                 'buoy_id': buoy_id,
                 'latitude': None,
                 'longitude': None
@@ -104,7 +154,19 @@ class NDBCStandardMeterologicalSpider(scrapy.Spider):
     def parse(self, response: Response) -> Generator:
         buoys_id_and_data_years = response.xpath('//a[@id="stdmet"]/../ul[@class="histfiles"]/li')
 
-        print(f"Found {len(buoys_id_and_data_years)} buoys with historical data links.")
+        if not buoys_id_and_data_years:
+            # An empty result here means the page structure moved under us. The
+            # crawl would otherwise "succeed" with zero items and the silver
+            # stage would happily reload the unchanged bronze, so nothing would
+            # look broken until someone noticed the data had stopped advancing.
+            raise ValueError(
+                'no station entries matched the stdmet histfiles XPath -- '
+                'NDBC likely changed the page structure'
+            )
+
+        self.logger.info(
+            f'Found {len(buoys_id_and_data_years)} buoys with historical data links.'
+        )
 
         for buoys in buoys_id_and_data_years:
             buoy_id = buoys.xpath('./text()[1]').get()
@@ -118,6 +180,12 @@ class NDBCStandardMeterologicalSpider(scrapy.Spider):
             for data_year_link in data_years_links:
                 # Get the measurement data for the buoy and year
                 txt_data_link = data_year_link.replace('download_data', 'view_text_file')
+
+                source_stem, year = source_identity(txt_data_link)
+                if self._already_have(buoy_id, year, source_stem):
+                    self._skipped_cached += 1
+                    continue
+
                 yield response.follow(
                     txt_data_link,
                     callback=self._get_data_from_url,
@@ -131,6 +199,12 @@ class NDBCStandardMeterologicalSpider(scrapy.Spider):
                 callback=self._get_station_summary,
                 cb_kwargs={'buoy_id': buoy_id}
             )
+
+    def closed(self, reason):
+        # Surfaced through Scrapy's stats dict, which PipelineRunTracker
+        # persists into pipeline_runs.scrapy_stats -- so "how much did
+        # incremental crawling actually save?" is answerable in SQL.
+        self.crawler.stats.set_value('ndbc/skipped_cached', self._skipped_cached)
 
 
 if __name__ == "__main__":

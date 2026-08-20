@@ -1,72 +1,54 @@
-# Define your item pipelines here
-#
-# Don't forget to add your pipeline to the ITEM_PIPELINES setting
+# Item pipelines for the bronze ingestion stage.
 # See: https://docs.scrapy.org/en/latest/topics/item-pipeline.html
+from pathlib import Path
 
-
-# useful for handling different item types with a single interface
-# from itemadapter import ItemAdapter
 import pandas as pd
 
 
-class NdbcScraperPipeline:
-    def process_item(self, item, spider):
-        return item
+class BronzeParquetPipeline:
+    """Writes one Parquet file per scraped response into a Hive-partitioned
+    bronze landing zone, keyed on (buoy_id, year) for observations and
+    (buoy_id) for coordinates. Each item already carries a full buoy-year
+    table (see spider `_get_data_from_url`), so the write happens directly on
+    `process_item` — no fixed-size buffering is needed, and re-scraping the
+    same source file simply overwrites its own partition file (idempotent).
+    """
 
-
-class BatchProcessingPipeline:
-    def __init__(self, batch_size=100):
-        self.buoy_data_saving_path = 'batch_output.csv'
-
-        if pd.io.common.file_exists(self.buoy_data_saving_path): # type: ignore
-            raise FileExistsError(f"The file {self.buoy_data_saving_path} already exists. Please remove it before running the spider to avoid data loss.")
-        
-        self.buoy_coordinates_saving_path = 'buoy_coordinates.csv'
-
-        if pd.io.common.file_exists(self.buoy_coordinates_saving_path): # type: ignore
-            raise FileExistsError(f"The file {self.buoy_coordinates_saving_path} already exists. Please remove it before running the spider to avoid data loss.")
-
-        self.batch_size = batch_size
-        self.buoy_data_items = []
-        self.buoy_coordinates_df = pd.DataFrame(columns=['buoy_id', 'latitude', 'longitude'])
+    def __init__(self, bronze_root: str):
+        self.bronze_root = Path(bronze_root)
 
     @classmethod
     def from_crawler(cls, crawler):
         return cls(
-            batch_size=crawler.settings.getint('BATCH_SIZE', 100)
+            bronze_root=crawler.settings.get('BRONZE_ROOT', 'data/bronze')
         )
 
-    def process_item(self, item: dict):
-        if 'latitude' not in item:
-            self.buoy_data_items.append(dict(item))
-            
-            if len(self.buoy_data_items) >= self.batch_size:
-                self._process_batch()
-        else:
-            self.buoy_coordinates_df = pd.concat(
-                [self.buoy_coordinates_df, pd.DataFrame([dict(item)])],
-                ignore_index=True
-            )
+    def process_item(self, item: dict, spider):
+        if item.get('kind') == 'observations':
+            self._write_observations(item)
+        elif item.get('kind') == 'coordinates':
+            self._write_coordinates(item)
 
         return item
 
-    def _process_batch(self):
-        if not self.buoy_data_items:
-            return
-
-        df_batch = pd.DataFrame(self.buoy_data_items)
-
-        df_batch.to_csv(
-            self.buoy_data_saving_path,
-            mode='a',
-            index=False,
-            header=not pd.io.common.file_exists(self.buoy_data_saving_path) # type: ignore
+    def _write_observations(self, item: dict) -> None:
+        partition_dir = (
+            self.bronze_root
+            / 'observations'
+            / f"buoy_id={item['buoy_id']}"
+            / f"year={item['year']}"
         )
+        partition_dir.mkdir(parents=True, exist_ok=True)
 
-        self.buoy_data_items = []
+        df = pd.DataFrame(item['records'])
+        df.to_parquet(partition_dir / f"{item['source_stem']}.parquet", index=False)
 
-    def close_spider(self):
-        if self.buoy_data_items:
-            self._process_batch()
+    def _write_coordinates(self, item: dict) -> None:
+        partition_dir = self.bronze_root / 'coordinates' / f"buoy_id={item['buoy_id']}"
+        partition_dir.mkdir(parents=True, exist_ok=True)
 
-        self.buoy_coordinates_df.to_csv(self.buoy_coordinates_saving_path, index=False)
+        df = pd.DataFrame([{
+            'latitude': item.get('latitude'),
+            'longitude': item.get('longitude'),
+        }])
+        df.to_parquet(partition_dir / 'part.parquet', index=False)

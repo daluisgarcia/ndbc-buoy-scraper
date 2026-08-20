@@ -1,0 +1,95 @@
+# Only Postgres is containerized. The scraper AND the silver ETL both run on
+# the host (uv/scrapy + DuckDB, Python 3.13) and are NOT part of this file.
+#
+# ONE file for both local development and the server. There is no prod override
+# any more: everything that used to live in docker-compose.prod.yml is either
+# correct everywhere (checksums, log rotation, restart policy, shutdown grace)
+# or parameterized below for the few things that genuinely depend on the box.
+#
+# Version pin (verified 2026-08-10):
+#   - postgres:16-alpine — actively published tag on Docker Hub library/postgres.
+#
+# Requires a .env next to this file (see .env.example):
+#
+#   POSTGRES_PASSWORD=<generate: openssl rand -base64 32>
+#
+services:
+  postgres:
+    image: postgres:16-alpine
+
+    # Comes back after a reboot or a daemon restart, and stays down when you
+    # stop it deliberately.
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${PG_USER:-ndbc}
+      POSTGRES_DB: ${PG_DB:-ndbc}
+      # No default, deliberately: Compose REFUSES to start without it. A
+      # defaulted database password is the one setting that must not silently
+      # carry a development value onto a server. `cp .env.example .env` is
+      # enough to satisfy it locally.
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?set PG_PASSWORD in .env}
+      # Page-level checksums, so silent disk corruption surfaces as a loud
+      # error instead of as wrong numbers in a chart. Applies at initdb ONLY --
+      # it cannot be turned on later without recreating the volume.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+
+    # Replaces the image's built-in defaults wholesale with the tuned file.
+    # Trailing `-c` flags override individual settings from that file, which is
+    # the escape hatch for a development machine smaller than the 6 GB target:
+    # set PG_SHARED_BUFFERS=256MB in .env rather than maintaining a second conf.
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-1024MB}
+
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+      # Applies automatically on first init of a fresh volume, and ONLY then.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./db/postgresql.prod.conf:/etc/postgresql/postgresql.conf:ro
+
+    ports:
+      # Loopback only. The scraper and the silver job run on the HOST, so the
+      # port must be published -- but nothing outside the machine needs it.
+      - "127.0.0.1:5434:5432"
+
+    healthcheck:
+      # PG_USER, not POSTGRES_USER: Compose interpolates this from .env on the
+      # HOST, not from the container's environment, so it has to use the same
+      # name the environment block above reads.
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-ndbc}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+    # Postgres allocates parallel-query state in /dev/shm. Docker's 64 MB
+    # default is too small once max_parallel_workers_per_gather > 0 and
+    # produces "could not resize shared memory segment" mid-query.
+    shm_size: 256mb
+
+    deploy:
+      resources:
+        limits:
+          # Hard ceiling so a runaway query cannot take the box down with the
+          # scraper and DuckDB on it. The default sits above the ~2.7 GB the
+          # tuned config can reach (see db/postgresql.prod.conf) with headroom
+          # for backend overhead.
+          memory: ${POSTGRES_MEM_LIMIT:-3g}
+
+    # Without rotation, container logs grow until they fill the disk -- and on
+    # a data box the disk filling takes Postgres down with it.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Postgres needs time for a clean shutdown checkpoint; the 10s default can
+    # SIGKILL it mid-checkpoint and force crash recovery on the next start.
+    stop_grace_period: 1m
+
+# No top-level `volumes:` block: the data directory is the ./pgdata bind mount
+# declared above, so there is no named volume for Compose to create.
