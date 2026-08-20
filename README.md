@@ -215,3 +215,10 @@ artifact, and it is far smaller than the database it produces.
 | `db/init.sql` | Schema; column order mirrors `silver.py` |
 | `db/postgresql.prod.conf` | Tuned Postgres config, applied on every machine |
 | `Makefile` | Every command above |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+The data itself is not covered by this license: NDBC observations are published
+by [NOAA](https://www.ndbc.noaa.gov/) and are in the public domain.
