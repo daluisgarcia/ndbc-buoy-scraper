@@ -9,3 +9,20 @@ wheels/
 # Virtual environments
 .venv
 .DS_Store
+
+# Bronze landing zone (generated data, shared Docker volume)
+data/
+
+# Legacy CSV outputs from the pre-medallion pipeline
+batch_output.csv
+buoy_coordinates.csv
+
+# Deployment-local files. docker-compose.override.yml is auto-loaded by
+# Compose, so keeping it out of the repo means a machine-specific tweak can sit
+# next to the tracked docker-compose.yml without leaking into anyone else's
+# checkout. Nothing in the repo ships one -- the compose file is the same on
+# every machine, with .env carrying the differences.
+docker-compose.override.yml
+.env
+pgdata/
+.atl/
