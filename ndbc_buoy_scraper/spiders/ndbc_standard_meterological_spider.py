@@ -7,6 +7,7 @@ from collections.abc import Generator
 from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
+import pyarrow.parquet as pq
 import scrapy
 from scrapy.http import Response
 
@@ -67,8 +68,35 @@ class NDBCStandardMeterologicalSpider(scrapy.Spider):
             f'{source_stem}.parquet',
         )
 
+    def _bronze_file_is_usable(self, path: str) -> bool:
+        """True when `path` holds a Parquet file the silver stage can read.
+
+        Existence alone is the wrong test. A zero-byte or zero-column Parquet --
+        left behind by a killed run, a full disk, or the schema-loss bug that
+        used to drop the header of a row-less NDBC file -- makes DuckDB reject
+        the read outright ("Need at least one non-root column in the file"),
+        failing the ENTIRE year rather than just this buoy.
+
+        Counting such a file as "already have" is what makes that fatal: a
+        closed year is never re-fetched, so nothing would ever replace the bad
+        file and every later silver run would die in the same place. Reading the
+        footer instead lets the next crawl overwrite it -- the pipeline
+        self-heals rather than wedging.
+
+        One footer read (~40us) per cached file: ~0.6s across a full
+        15,700-file bronze tree, against the ~17,000 HTTP requests the skip
+        avoids.
+        """
+        try:
+            return pq.ParquetFile(path).metadata.num_columns > 0
+        except Exception:
+            # Deliberately broad. Absent, truncated, zero-byte, and
+            # not-actually-Parquet all mean the same thing to the caller:
+            # this buoy-year is not safely in bronze, so re-fetch it.
+            return False
+
     def _already_have(self, buoy_id: str, year: str, source_stem: str) -> bool:
-        """True when this buoy-year is in bronze AND can never change again.
+        """True when this buoy-year is READABLE in bronze AND can never change.
 
         NDBC rewrites only the in-progress year's file; once a year closes its
         historical file is immutable. Re-fetching those is the difference
@@ -83,7 +111,9 @@ class NDBCStandardMeterologicalSpider(scrapy.Spider):
         current_year = dt.datetime.now(dt.UTC).year
         if not year.isdigit() or int(year) >= current_year:
             return False
-        return os.path.exists(self._bronze_path(buoy_id, year, source_stem))
+        return self._bronze_file_is_usable(
+            self._bronze_path(buoy_id, year, source_stem)
+        )
 
     def _get_data_from_url(self, response: Response, buoy_id: str) -> Generator[dict]:
         if response.url in self._urls_seen:
@@ -104,6 +134,14 @@ class NDBCStandardMeterologicalSpider(scrapy.Spider):
             'buoy_id': buoy_id,
             'year': year,
             'source_stem': source_stem,
+            # Carried separately because `to_dict(orient='records')` erases the
+            # schema of a row-less frame: 18 column names go in, a bare `[]`
+            # comes out. NDBC serves header-only files for buoy-years with no
+            # reports (e.g. 47072h2003), and rebuilding one from `records`
+            # alone yields a zero-column Parquet that DuckDB cannot read at
+            # all -- taking the whole year's load down with it. The writer uses
+            # this to keep the header. See BronzeParquetPipeline.
+            'columns': list(df.columns),
             'records': df.to_dict(orient='records'),
         }
 

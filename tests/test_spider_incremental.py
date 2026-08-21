@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 
+import pandas as pd
 import pytest
 
 from ndbc_buoy_scraper.spiders.ndbc_standard_meterological_spider import (
@@ -38,10 +39,34 @@ def spider(tmp_path):
     return instance
 
 
-def _write_bronze_marker(tmp_path, buoy_id, year, stem):
+def _bronze_dir(tmp_path, buoy_id, year):
     directory = tmp_path / "observations" / f"buoy_id={buoy_id}" / f"year={year}"
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / f"{stem}.parquet").write_bytes(b"")
+    return directory
+
+
+def _write_bronze_marker(tmp_path, buoy_id, year, stem):
+    """Write a READABLE bronze parquet, i.e. what a healthy crawl leaves behind.
+
+    This used to write `b""`. A zero-byte file is exactly the corruption case
+    `_bronze_file_is_usable` now rejects, so asserting it counted as "already
+    have" was pinning the bug rather than the behaviour.
+    """
+    df = pd.DataFrame([{"#YY": 2019, "MM": 1, "WVHT": 1.5}])
+    df.to_parquet(_bronze_dir(tmp_path, buoy_id, year) / f"{stem}.parquet", index=False)
+
+
+def _write_header_only_bronze(tmp_path, buoy_id, year, stem):
+    """A buoy-year NDBC reported nothing for: real header, zero rows."""
+    df = pd.DataFrame([], columns=["#YY", "MM", "WVHT"])
+    df.to_parquet(_bronze_dir(tmp_path, buoy_id, year) / f"{stem}.parquet", index=False)
+
+
+def _write_zero_column_bronze(tmp_path, buoy_id, year, stem):
+    """The poison pill: valid Parquet, no columns. DuckDB cannot open it."""
+    pd.DataFrame([]).to_parquet(
+        _bronze_dir(tmp_path, buoy_id, year) / f"{stem}.parquet", index=False
+    )
 
 
 class TestSourceIdentity:
@@ -103,6 +128,38 @@ class TestIncrementalSkip:
             str(tmp_path), "observations", "buoy_id=41004", "year=2019",
             "41004h2019.parquet",
         )
+
+
+class TestUnreadableBronzeIsRefetched:
+    """A closed year is never re-fetched, so an unreadable bronze file there is
+    permanent: silver fails on it every run and nothing ever replaces it. The
+    skip must therefore test readability, not mere existence.
+    """
+
+    def test_zero_column_parquet_is_refetched(self, spider, tmp_path):
+        _write_zero_column_bronze(tmp_path, "47072", "2003", "47072h2003")
+        assert spider._already_have("47072", "2003", "47072h2003") is False
+
+    def test_zero_byte_file_is_refetched(self, spider, tmp_path):
+        path = _bronze_dir(tmp_path, "47072", "2003") / "47072h2003.parquet"
+        path.write_bytes(b"")
+        assert spider._already_have("47072", "2003", "47072h2003") is False
+
+    def test_truncated_parquet_is_refetched(self, spider, tmp_path):
+        """A run killed mid-write leaves a file with no readable footer."""
+        _write_bronze_marker(tmp_path, "47072", "2003", "47072h2003")
+        path = _bronze_dir(tmp_path, "47072", "2003") / "47072h2003.parquet"
+        path.write_bytes(path.read_bytes()[: path.stat().st_size // 2])
+        assert spider._already_have("47072", "2003", "47072h2003") is False
+
+    def test_header_only_parquet_counts_as_already_have(self, spider, tmp_path):
+        """0 rows is legitimate data, not corruption.
+
+        NDBC genuinely has buoy-years with no reports. DuckDB reads a 0-row
+        file fine, so re-fetching it every run would be pure waste.
+        """
+        _write_header_only_bronze(tmp_path, "47072", "2003", "47072h2003")
+        assert spider._already_have("47072", "2003", "47072h2003") is True
 
 
 class TestUrlBookkeeping:
