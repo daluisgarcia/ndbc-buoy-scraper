@@ -93,9 +93,16 @@ RUN_UNIT ?= ndbc-run
 # UV= is passed explicitly because the unit gets systemd's minimal PATH, where
 # uv is not resolvable; the value is expanded here, in the login shell that
 # still has it.
+#
+# HOME is forwarded for the same reason: systemd's minimal environment does not
+# set it, and DuckDB resolves its extension directory (~/.duckdb/extensions) from
+# HOME. Without it, `INSTALL postgres` in the silver job dies with
+# "IO Error: Can't find the home directory at ''". uv's cache resolves from HOME
+# too, so this keeps both stages on the same paths they use interactively.
 run-bg:
 	sudo systemd-run --collect --unit=$(RUN_UNIT) \
 		--working-directory=$(CURDIR) \
+		--setenv=HOME=$(HOME) \
 		/usr/bin/make -C $(CURDIR) UV=$(UV) pipeline
 	@echo "Started as $(RUN_UNIT). Follow with: make logs"
 
