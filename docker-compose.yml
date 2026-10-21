@@ -54,7 +54,7 @@ services:
     ports:
       # Loopback only. The scraper and the silver job run on the HOST, so the
       # port must be published -- but nothing outside the machine needs it.
-      - "127.0.0.1:5434:5432"
+      - "5434:5432"
 
     healthcheck:
       # PG_USER, not POSTGRES_USER: Compose interpolates this from .env on the
