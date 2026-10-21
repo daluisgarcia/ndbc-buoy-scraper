@@ -20,6 +20,15 @@ from ndbc_buoy_scraper.coordinates_converter import (
 # "41001h2020.txt.gz", verified against a live view_text_file.php response.
 FILENAME_YEAR_PATTERN = re.compile(r'h(\d{4})\.txt')
 
+# Caps on what one quarantine record may carry. A quarantine file is an input
+# for a human re-extracting records by hand: past a few dozen bad lines that
+# is no longer a manual job, and keeping every line of a wholly-garbage
+# response would put an unbounded blob on disk for no added diagnosis. Both
+# caps are reported when they bite -- a silent truncation would read as "this
+# is all that was wrong".
+MAX_QUARANTINED_LINES = 50
+MAX_QUARANTINED_LINE_CHARS = 500
+
 
 def source_identity(url: str) -> tuple[str, str]:
     """Derive (bronze source stem, four-digit year) from an NDBC data URL.
@@ -115,6 +124,80 @@ class NDBCStandardMeterologicalSpider(scrapy.Spider):
             self._bronze_path(buoy_id, year, source_stem)
         )
 
+    def _malformed_report(
+        self,
+        response: Response,
+        buoy_id: str,
+        year: str,
+        source_stem: str,
+        df: pd.DataFrame,
+        dropped_lines: int,
+    ) -> dict:
+        """Build the quarantine record for a file NDBC served corrupt.
+
+        The URL alone would not be enough to act on. Re-fetching an 8,000-line
+        file and eyeballing it for the one fused record is not manual
+        validation, it is a scavenger hunt -- so this pins down the exact line
+        numbers and carries their raw text, which is the whole input a human
+        needs to reconstruct the lost observations by hand.
+
+        Locating those lines means tokenizing the entire response, which is why
+        it runs ONLY once the cheap count diff has already proven the file is
+        corrupt. Clean files -- effectively all ~17,000 of them -- never pay it.
+        """
+        expected_fields = len(df.columns)
+        bad_lines = []
+        truncated = False
+        # `line_number` is 1-based over the physical file, header included, so
+        # it matches what `sed -n '3474p'` and pandas' own ParserError report.
+        for offset, line in enumerate(response.text.splitlines()[1:], start=2):
+            if not line.strip():
+                continue
+            field_count = len(line.split())
+            # pandas skips a line only when it has MORE fields than the header;
+            # short lines are padded with NaN and are not data loss.
+            if field_count <= expected_fields:
+                continue
+            if len(bad_lines) >= MAX_QUARANTINED_LINES:
+                truncated = True
+                break
+            bad_lines.append({
+                'line_number': offset,
+                'field_count': field_count,
+                'text': line[:MAX_QUARANTINED_LINE_CHARS],
+            })
+
+        if truncated:
+            self.logger.warning(
+                f'{source_stem}: more than {MAX_QUARANTINED_LINES} malformed '
+                f'lines; quarantine record keeps only the first '
+                f'{MAX_QUARANTINED_LINES}'
+            )
+        elif len(bad_lines) != dropped_lines:
+            # The count diff is authoritative; this locator is a heuristic over
+            # the same bytes. Saying so beats handing over a line list that
+            # quietly accounts for fewer drops than actually happened.
+            self.logger.warning(
+                f'{source_stem}: located {len(bad_lines)} malformed line(s) but '
+                f'{dropped_lines} row(s) went missing -- the quarantine record '
+                f'does not explain every drop'
+            )
+
+        return {
+            'kind': 'malformed',
+            'buoy_id': buoy_id,
+            'year': year,
+            'source_stem': source_stem,
+            'url': response.url,
+            'expected_fields': expected_fields,
+            'columns': list(df.columns),
+            'rows_parsed': len(df),
+            'dropped_lines': dropped_lines,
+            'located_lines': len(bad_lines),
+            'lines_truncated': truncated,
+            'bad_lines': bad_lines,
+        }
+
     def _get_data_from_url(self, response: Response, buoy_id: str) -> Generator[dict]:
         if response.url in self._urls_seen:
             self.logger.debug(f"URL {response.url} already seen, skipping.")
@@ -123,11 +206,53 @@ class NDBCStandardMeterologicalSpider(scrapy.Spider):
         # Mechanical decode only: no unit-row drop, no renames, no datetime
         # construction. All semantic transforms live in
         # ndbc_buoy_scraper/silver.py (DuckDB).
-        df = pd.read_csv(io.StringIO(response.text), sep=r'\s+', low_memory=False) # type: ignore
+        #
+        # `on_bad_lines='skip'` is about NDBC's own corruption, not about being
+        # lenient with our parsing. A handful of historical files are served
+        # with a newline missing between two records, fusing them into one
+        # physical line whose trailing and leading fields collide into a single
+        # token -- aban6h2006.txt line 3474 ends "... 6.5 99.002006 06 07 16 00
+        # ..." and offers 35 fields where the header declares 18. Without this,
+        # that one upstream defect raises ParserError inside the callback and
+        # takes the buoy-year down entirely; the year never reaches bronze, so
+        # the incremental skip never closes it and every subsequent run repeats
+        # the same failure.
+        #
+        # Repairing the fused line is deliberately NOT done here: splitting
+        # "99.002006" correctly needs field-width knowledge this layer does not
+        # have, and bronze is a mechanical decode. Dropping the line costs the
+        # two observations it held; guessing wrong would poison silver instead.
+        df = pd.read_csv(  # type: ignore
+            io.StringIO(response.text),
+            sep=r'\s+',
+            low_memory=False,
+            on_bad_lines='skip',
+        )
 
         source_stem, year = source_identity(response.url)
 
+        # Skipping is only acceptable because it is counted. `on_bad_lines`
+        # reports nothing back, so a silent skip would look identical to a
+        # clean parse and upstream rot would grow invisible across runs.
+        # Diffing raw data lines against parsed rows is exact for this format:
+        # every non-blank line after the header becomes exactly one row.
+        raw_data_lines = sum(
+            1 for line in response.text.splitlines()[1:] if line.strip()
+        )
+        dropped_lines = raw_data_lines - len(df)
+
         self._urls_seen.add(response.url)
+
+        if dropped_lines > 0:
+            self.logger.warning(
+                f'{dropped_lines} malformed line(s) dropped from {source_stem} '
+                f'(buoy {buoy_id}) -- NDBC served a corrupt file: {response.url}'
+            )
+            self.crawler.stats.inc_value('ndbc/malformed_lines_dropped', dropped_lines)
+            self.crawler.stats.inc_value('ndbc/files_with_malformed_lines')
+            yield self._malformed_report(
+                response, buoy_id, year, source_stem, df, dropped_lines
+            )
 
         yield {
             'kind': 'observations',

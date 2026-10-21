@@ -46,10 +46,24 @@ its own run.
 ```
 data/bronze/
 ├── observations/buoy_id=<id>/year=<yyyy>/<source_stem>.parquet
-└── coordinates/buoy_id=<id>/part.parquet
+├── coordinates/buoy_id=<id>/part.parquet
+└── _malformed/<source_stem>.json
 ```
 
 Re-scraping a file overwrites its own partition, so ingest is idempotent.
+
+A few NDBC files are served corrupt (a missing newline fuses two records into
+one line). The decode drops those lines instead of failing the whole buoy-year,
+and quarantines what it dropped — URL, line numbers, raw text — under
+`_malformed/`, so the records can be re-extracted by hand:
+
+```bash
+make malformed           # summary of every corrupt source file
+FULL=1 make malformed    # plus the dropped lines themselves
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md#corrupt-source-files) for why they are
+dropped rather than repaired.
 
 **Both stages are incremental**, which is the thing to understand before you run
 either one:

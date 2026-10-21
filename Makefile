@@ -1,4 +1,4 @@
-.PHONY: scrape up silver health pipeline test down db-config
+.PHONY: scrape up silver health pipeline test down db-config malformed
 
 # Absolute path to uv, resolved from the invoking shell's PATH.
 #
@@ -39,6 +39,17 @@ silver:
 # monitoring check as-is -- run it after a run, or from an external probe.
 health:
 	$(UV) run python -m ndbc_buoy_scraper.healthcheck
+
+# List the source files NDBC served corrupt, so they can be re-extracted and
+# validated by hand. The scrape drops the malformed lines to keep one bad file
+# from wedging its whole buoy-year, and writes what it dropped -- URL, exact
+# line numbers, raw text -- to data/bronze/_malformed/.
+#
+# Read with DuckDB rather than jq: it is already a project dependency, and it
+# turns the quarantine directory into a SQL table. Add FULL=1 to print the
+# offending lines themselves instead of just the per-file summary.
+malformed:
+	$(UV) run python -m ndbc_buoy_scraper.malformed
 
 # Full pipeline, in order. This is what `run-bg` executes detached.
 pipeline: scrape silver

@@ -1,8 +1,15 @@
 # Item pipelines for the bronze ingestion stage.
 # See: https://docs.scrapy.org/en/latest/topics/item-pipeline.html
+import json
 from pathlib import Path
 
 import pandas as pd
+
+# Sidecar directory under the bronze root holding one JSON record per source
+# file NDBC served corrupt. Leading underscore so it sorts away from the
+# `observations/` and `coordinates/` Hive trees and can never be mistaken for
+# a partition key by a `read_parquet` glob.
+QUARANTINE_DIR = '_malformed'
 
 
 class BronzeParquetPipeline:
@@ -34,8 +41,41 @@ class BronzeParquetPipeline:
             self._write_observations(item, spider)
         elif item.get('kind') == 'coordinates':
             self._write_coordinates(item)
+        elif item.get('kind') == 'malformed':
+            self._write_malformed(item, spider)
 
         return item
+
+    def _write_malformed(self, item: dict, spider) -> None:
+        """Persist the quarantine record for one corrupt NDBC source file.
+
+        This lands in bronze rather than in Postgres on purpose. `pipeline_runs`
+        is best-effort monitoring the crawl is designed to survive without
+        (TRACK_RUNS=0, an unreachable database), and this record is the ONLY
+        surviving evidence of data the decode silently dropped. Putting the
+        evidence of a silent loss behind an optional backend would reproduce
+        the exact failure the record exists to prevent. Bronze is written by
+        definition -- it is the stage's whole output.
+
+        One file per source stem, mirroring the Parquet partitions: re-scraping
+        the same buoy-year overwrites its own record instead of appending a
+        duplicate on every run. A file that disappears from here because NDBC
+        fixed its data is the correct outcome -- but only a full refresh
+        rewrites it, since a closed year is otherwise never re-fetched.
+        """
+        quarantine_dir = self.bronze_root / QUARANTINE_DIR
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+        path = quarantine_dir / f"{item['source_stem']}.json"
+        # Written whole via a temp file and an atomic rename: a run killed
+        # mid-write would otherwise leave truncated JSON that breaks the
+        # DuckDB read of the WHOLE quarantine glob, hiding every other record.
+        tmp_path = path.with_suffix('.json.tmp')
+        payload = {k: v for k, v in item.items() if k != 'kind'}
+        tmp_path.write_text(json.dumps(payload, indent=2, default=str), encoding='utf-8')
+        tmp_path.replace(path)
+
+        spider.logger.warning(f'quarantine record written: {path}')
 
     def _write_observations(self, item: dict, spider) -> None:
         columns = list(item.get('columns') or [])

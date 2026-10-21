@@ -62,10 +62,45 @@ The spider (`spiders/ndbc_standard_meterological_spider.py`) does a **mechanical
 ```
 data/bronze/
 ├── observations/buoy_id=<id>/year=<yyyy>/<source_stem>.parquet
-└── coordinates/buoy_id=<id>/part.parquet
+├── coordinates/buoy_id=<id>/part.parquet
+└── _malformed/<source_stem>.json          # quarantine, see below
 ```
 
 Re-scraping a file overwrites its own partition — ingest is idempotent.
+
+#### Corrupt source files
+
+A handful of NDBC historical files are served physically broken: a missing
+newline fuses two records into one line, so it carries roughly double the
+header's field count (`aban6h2006.txt` line 3474 offers 35 fields against 18).
+The decode drops those lines (`on_bad_lines='skip'`) rather than raising,
+because a `ParserError` aborts the callback — the buoy-year never reaches
+bronze, the incremental skip never closes it, and **every subsequent run dies
+at the same byte**. Losing two observations beats wedging a year permanently.
+
+Repairing the fused line is deliberately not attempted: splitting `99.002006`
+correctly needs field-width knowledge the bronze layer does not have, and
+guessing would poison silver instead of bronze.
+
+Because that drop is silent by nature, every occurrence is recorded three ways:
+the `ndbc/malformed_lines_dropped` and `ndbc/files_with_malformed_lines` Scrapy
+stats (which land in `pipeline_runs.scrapy_stats`), a warning in the crawl log,
+and a **quarantine record** under `_malformed/` carrying the URL to re-fetch,
+the exact line numbers, and the raw text of every dropped line — the full input
+for recovering those records by hand:
+
+```
+make malformed           # one summary line per corrupt file
+FULL=1 make malformed    # plus the dropped lines themselves
+```
+
+The quarantine lives in bronze rather than in Postgres on purpose.
+`pipeline_runs` is best-effort monitoring the crawl is designed to survive
+without (`TRACK_RUNS=0`, an unreachable database), and this record is the only
+surviving evidence of dropped data — putting evidence of a silent loss behind
+an optional backend would reproduce the very failure the record exists to
+prevent. `_malformed/` sits beside the Hive trees and matches neither of
+silver's `observations/**` and `coordinates/**` globs.
 
 ### Stage 2 — Silver (DuckDB)
 
